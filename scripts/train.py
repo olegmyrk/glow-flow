@@ -9,11 +9,12 @@ import signal
 from datetime import datetime
 
 # Dependency imports
+import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
 from .datasets import get_input_fns
-from glow.bijectors import GlowFlow
+from glow.bijectors import GlowFlow,GlowStep
 
 tfd = tfp.distributions
 
@@ -75,6 +76,16 @@ def parse_args():
                         default=int(1e6),
                         help="Total number of training steps to run.")
 
+    parser.add_argument("--learning_rate",
+                        type=float,
+                        default=0.001,
+                        help="Initital learning rate.")
+
+    parser.add_argument("--clip_gradient",
+                        type=float,
+                        default=1000.0,
+                        help="Generator gradient clip norm.")
+
     parser.add_argument(
         "--activation",
         type=lambda activation: getattr(tf.nn, activation),
@@ -82,7 +93,7 @@ def parse_args():
         help="Activation function for all hidden layers.")
 
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
-    parser.add_argument("--num_levels", type=int, default=3,
+    parser.add_argument("--num_levels", type=int, default=2,
                         help="Number of Glow levels in the flow.")
     parser.add_argument("--level_depth", type=int, default=3,
                         help="Number of flow steps in each Glow level.")
@@ -91,12 +102,10 @@ def parse_args():
 
     return args
 
-
 def bits_per_dim(negative_log_likelihood, image_shape):
-    image_size = tf.reduce_prod(image_shape)
+    image_size = tf.cast(tf.reduce_prod(image_shape),dtype=tf.float32)
     return ((negative_log_likelihood + tf.log(256.0) * image_size)
             / (image_size * tf.log(2.0)))
-
 
 def pack_images(images, rows, cols):
     """Helper utility to make a field of images."""
@@ -130,31 +139,40 @@ def model_fn(features, labels, mode, params, config):
         EstimatorSpec: A tf.estimator.EstimatorSpec instance.
     """
     base_distribution = tfd.MultivariateNormalDiag(
-        loc=tf.zeros(features.shape[-3:]),
-        scale_diag=tf.ones(features.shape[-3:]))
+        loc=tf.zeros(np.prod(features.shape[-3:])),
+        scale_diag=tf.ones(np.prod(features.shape[-3:])))
 
     glow_flow = GlowFlow(
         num_levels=params['num_levels'],
         level_depth=params['level_depth'])
 
+    #glow_flow = GlowStep(
+    #                # Infer at the time of first forward
+    #                input_shape=None,
+    #                depth=params['level_depth'],
+    #                name="glow_step")
+
     transformed_glow_flow = tfd.TransformedDistribution(
-        distribution=base_distribution,
+        distribution=
+            tfd.TransformedDistribution(
+                distribution=base_distribution,
+                bijector=tfp.bijectors.Reshape(event_shape_out=features.shape[-3:], event_shape_in=[np.prod(features.shape[-3:])])
+            ),
         bijector=glow_flow,
         name="transformed_glow_flow")
 
     image_tile_summary("input", tf.to_float(features), rows=1, cols=16)
 
-    z = glow_flow.inverse(features)
+    z = tf.reshape(glow_flow.inverse(features), [-1, np.prod(features.shape[-3:])])
     prior_log_probs = base_distribution.log_prob(z)
     prior_log_likelihood = -tf.reduce_mean(prior_log_probs)
-    log_det_jacobians = glow_flow.inverse_log_det_jacobians(features)
-    log_probs = log_det_jacobians + log_det_jacobians
+    log_det_jacobians = glow_flow.inverse_log_det_jacobian(features, event_ndims=3)
+    log_probs = prior_log_probs + log_det_jacobians
 
     # Sanity check, remove when tested
-    assert tf.equal(log_probs, transformed_glow_flow.log_prob(features))
-
-    negative_log_likelihood = -tf.reduce_mean(log_probs)
-    bpd = bits_per_dim(negative_log_likelihood, features.shape[-3:])
+    with tf.control_dependencies([tf.equal(log_probs, transformed_glow_flow.log_prob(features))]):
+      negative_log_likelihood = -tf.reduce_mean(log_probs)
+      bpd = bits_per_dim(negative_log_likelihood, features.shape[-3:])
 
     loss = negative_log_likelihood
 
@@ -163,25 +181,22 @@ def model_fn(features, labels, mode, params, config):
         tf.reshape(negative_log_likelihood, []))
     tf.summary.scalar("bit_per_dim", tf.reshape(bpd, []))
 
-    #  TODO: prior likelihood and log det jacobians?
-    # tf.summary.scalar("prior_ll", tf.reshape(tf.reduce_mean(prior_ll), []))
-
     z_l2 = tf.norm(z, axis=1)
-    z_l2_mean, z_l2_var = tf.nn.moments(z_l2)
+    z_l2_mean, z_l2_var = tf.nn.moments(z_l2, axes=0)
     log_det_jacobians_mean, log_det_jacobians_var = tf.nn.moments(
-        log_det_jacobians)
-    prior_log_likelihood_mean, prior_log_likelihood_var = tf.nn.moments(
-        prior_log_likelihood)
+        log_det_jacobians, axes=0)
+    prior_log_probs_mean, prior_log_probs_var = tf.nn.moments(
+        prior_log_probs, axes=0)
 
     tf.summary.scalar("log_det_jacobians_mean",
                       tf.reshape(log_det_jacobians_mean, []))
     tf.summary.scalar("log_det_jacobians_var",
                       tf.reshape(log_det_jacobians_var, []))
 
-    tf.summary.scalar("prior_log_likelihood_mean",
-                      tf.reshape(prior_log_likelihood_mean, []))
-    tf.summary.scalar("prior_log_likelihood_var",
-                      tf.reshape(prior_log_likelihood_var, []))
+    tf.summary.scalar("prior_log_probs_mean",
+                      tf.reshape(prior_log_probs_mean, []))
+    tf.summary.scalar("prior_log_probs_var",
+                      tf.reshape(prior_log_probs_var, []))
 
     tf.summary.scalar("l2_z_mean", tf.reshape(z_l2_mean, []))
     tf.summary.scalar("z_l2_var", tf.reshape(z_l2_var, []))
@@ -222,10 +237,13 @@ def train_model(args):
     train_input_fn, eval_input_fn = get_input_fns(
         args.dataset, args.data_dir, args.batch_size)
 
+    session_config = tf.ConfigProto()
+    session_config.gpu_options.allow_growth=True
     estimator = tf.estimator.Estimator(
         model_fn,
         params=vars(args),
         config=tf.estimator.RunConfig(
+            session_config=session_config,
             model_dir=args.model_dir,
             save_checkpoints_steps=args.visualize_every))
 

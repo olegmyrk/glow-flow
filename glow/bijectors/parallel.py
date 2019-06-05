@@ -28,17 +28,12 @@ def _use_static_shape(input_tensor, ndims):
 
 class Parallel(tfb.Bijector):
     """Bijector which applies a set of bijectors in parallel.
-
     Example Use:
-
     ```python
     parallel = Parallel([Exp(), Identity()], name="parallel_of_exp_and_identity")
     ```
-
     Results in:
-
     * Forward:
-
      ```python
      axis = 1
      Parallel([Exp(), Identity()], axis=axis).forward(x)
@@ -51,9 +46,7 @@ class Parallel(tfb.Bijector):
            tf.split(x, axis=axis)
        ], axis=axis)
      ```
-
     * Inverse:
-
      ```python
      axis = 1
      Parallel([Exp(), Identity()], axis=axis).forward(y)
@@ -66,7 +59,6 @@ class Parallel(tfb.Bijector):
            tf.split(y, axis=axis)
        ], axis=axis)
      ```
-
     """
 
     def __init__(self,
@@ -76,7 +68,6 @@ class Parallel(tfb.Bijector):
                  validate_args=False,
                  name=None):
         """Instantiates `Parallel` bijector.
-
         Args:
             bijectors: Python `list` of bijector instances. An empty list makes this
                 bijector equivalent to the `Identity` bijector.
@@ -88,7 +79,6 @@ class Parallel(tfb.Bijector):
             name: Python `str`, name given to ops managed by this object.
                 Default: E.g.,
                 `Parallel([Exp(), Softplus()]).name == "parallel_of_exp_and_softplus"`.
-
         Raises:
             ValueError: if bijectors have different dtypes.
         """
@@ -135,7 +125,7 @@ class Parallel(tfb.Bijector):
 
         forward_min_event_ndims = max(
             bijector.forward_min_event_ndims for bijector in bijectors)
-        inverse_min_event_ndims = min(
+        inverse_min_event_ndims = max(
             bijector.forward_min_event_ndims for bijector in bijectors)
 
         super(Parallel, self).__init__(
@@ -226,9 +216,11 @@ class Parallel(tfb.Bijector):
                 tf.concat(split_x[i_start:i_end], axis=axis),
                 event_ndims=event_ndims,
                 **kwargs.get(bijector.name, {}))
+            if len(ildj.shape) == 0:
+                ildj=ildj*tf.ones(shape=tf.shape(y)[0:1])
             fldjs.append(fldj)
 
-        full_fldj = tf.concat(fldjs, axis=axis)
+        full_ildj = tf.reduce_sum(tf.concat(map(lambda t:tf.expand_dims(t, axis=1), ildjs), axis=1), axis=1)
 
         return full_fldj
 
@@ -258,8 +250,10 @@ class Parallel(tfb.Bijector):
                 tf.concat(split_y[i_start:i_end], axis=axis),
                 event_ndims=event_ndims,
                 **kwargs.get(bijector.name, {}))
+            if len(ildj.shape) == 0:
+                ildj=ildj*tf.ones(shape=tf.shape(y)[0:1])
             ildjs.append(ildj)
 
-        full_ildj = tf.concat(ildjs, axis=axis)
+        full_ildj = tf.reduce_sum(tf.concat(list(map(lambda t:tf.expand_dims(t, axis=1), ildjs)), axis=1), axis=1)
 
         return full_ildj

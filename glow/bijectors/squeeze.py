@@ -7,9 +7,6 @@ from __future__ import print_function
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from .transpose import Transpose
-
-
 __all__ = [
     "Squeeze",
 ]
@@ -20,7 +17,6 @@ tfb = tfp.bijectors
 
 class Squeeze(tfb.Bijector):
     """Squeeze Bijector
-
     TODO: Should probably be renamed since this does not only squeeze,
     but also transposes some axis in between.
     """
